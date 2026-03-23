@@ -251,7 +251,7 @@ impl TailProcessor {
             }
         }
 
-        // Set up file watcher
+        // Set up file watcher (bounded channel prevents memory leak from event backlog)
         let (tx, rx) = mpsc::channel();
         let mut watcher: RecommendedWatcher = Watcher::new(tx, NotifyConfig::default())?;
         watcher.watch(file_path, RecursiveMode::NonRecursive)?;
@@ -1015,7 +1015,7 @@ impl TailProcessor {
                 position: pos,
                 lines: VecDeque::new(),
                 raw_lines: VecDeque::new(),
-                max_lines: 10,
+                max_lines: self.max_buffer_lines,
                 line_count: 0,
                 last_update: std::time::SystemTime::now(),
                 file_id,
@@ -1029,6 +1029,9 @@ impl TailProcessor {
                     if self.filter.should_show_line(&line) {
                         let colored_line = self.colorizer.colorize_line(&line);
                         tracker.lines.push_back(colored_line);
+                        while tracker.lines.len() > tracker.max_lines {
+                            tracker.lines.pop_front();
+                        }
                     }
                 }
             }
@@ -1056,80 +1059,41 @@ impl TailProcessor {
 
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
-        let _ = ctrlc::set_handler(move || {
+        if ctrlc::set_handler(move || {
             r.store(false, Ordering::SeqCst);
-        });
+        }).is_err() {
+            // Handler already installed from a previous invocation; proceed without
+        }
 
         while running.load(Ordering::SeqCst) {
+            // Drain all pending watcher events to prevent channel backlog
+            loop {
+                match rx.try_recv() {
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+
             for tracker in &mut file_trackers {
+                let (rotated, _) = self.check_file_updates(tracker)?;
+                if rotated {
+                    let _ = watcher.unwatch(&tracker.path);
+                    let _ = watcher.watch(&tracker.path, RecursiveMode::NonRecursive);
+                }
+
+                // Print any new lines to stdout (scroll mode)
                 let filename = tracker.path.file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                // Check for log rotation
-                let mut was_rotated = false;
-                if let (Some(ref open_id), Some(path_id)) = (&tracker.file_id, get_file_id(&tracker.path)) {
-                    if *open_id != path_id {
-                        // Drain remaining data from old (rotated) file
-                        let old_size = tracker.file.metadata().map(|m| m.len()).unwrap_or(tracker.position);
-                        if old_size > tracker.position {
-                            tracker.file.seek(SeekFrom::Start(tracker.position))?;
-                            let mut reader = BufReader::with_capacity(self.buffer_size, &tracker.file);
-                            let mut line = String::new();
-                            while reader.read_line(&mut line)? > 0 {
-                                let clean_line = line.trim_end().to_string();
-                                if self.filter.should_show_line(&clean_line) {
-                                    let colored_line = self.colorizer.colorize_line(&clean_line);
-                                    println!("[{}] {}", filename, colored_line);
-                                }
-                                line.clear();
-                            }
-                            tracker.position = old_size;
-                        }
-
-                        // Reopen the new file
-                        if let Ok(new_file) = File::open(&tracker.path) {
-                            tracker.file = new_file;
-                            tracker.position = 0;
-                            tracker.file_id = get_open_file_id(&tracker.file);
-                            let _ = watcher.unwatch(&tracker.path);
-                            let _ = watcher.watch(&tracker.path, RecursiveMode::NonRecursive);
-                            was_rotated = true;
-                        }
-                    }
+                    .unwrap_or("unknown");
+                // In scroll mode, lines are accumulated by check_file_updates
+                // but we only print and discard to keep memory bounded
+                while let Some(line) = tracker.lines.pop_front() {
+                    println!("[{}] {}", filename, line);
                 }
-
-                let current_size = tracker.file.metadata()?.len();
-
-                if current_size > tracker.position {
-                    tracker.file.seek(SeekFrom::Start(tracker.position))?;
-                    let mut reader = BufReader::with_capacity(self.buffer_size, &tracker.file);
-
-                    let mut line = String::new();
-                    while reader.read_line(&mut line)? > 0 {
-                        let clean_line = line.trim_end().to_string();
-                        if self.filter.should_show_line(&clean_line) {
-                            let colored_line = self.colorizer.colorize_line(&clean_line);
-                            println!("[{}] {}", filename, colored_line);
-                        }
-                        line.clear();
-                    }
-
-                    tracker.position = current_size;
-                } else if current_size < tracker.position && !was_rotated {
-                    // File truncated in place
-                    tracker.position = 0;
-                    tracker.file.seek(SeekFrom::Start(0))?;
-                }
+                tracker.raw_lines.clear();
             }
 
-            match rx.try_recv() {
-                Ok(_) => {}
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
+            thread::sleep(Duration::from_millis(100));
         }
 
         Ok(())
@@ -1137,8 +1101,18 @@ impl TailProcessor {
 
     fn count_lines_in_file(&self, path: &PathBuf) -> Result<usize> {
         let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        Ok(reader.lines().count())
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut count = 0usize;
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            count += buf.iter().filter(|&&b| b == b'\n').count();
+            let len = buf.len();
+            reader.consume(len);
+        }
+        Ok(count)
     }
 
     /// Check for new content and log rotation. Returns true if the file was rotated.

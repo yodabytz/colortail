@@ -5,17 +5,39 @@ pub struct Colorizer {
     theme: Theme,
     no_color: bool,
     ansi_span_regex: Regex,
+    base_color_prefix: String,
+    base_color_suffix: String,
+    base_restore: String,
 }
 
 impl Colorizer {
     pub fn new(theme: Theme, no_color: bool) -> Self {
         // Regex to match existing ANSI colored spans to avoid double-coloring
         let ansi_span_regex = Regex::new(r"\x1b\[[0-9;]*m.*?\x1b\[0m").unwrap();
-        
+
+        let base_color_prefix = if let Some(base) = theme.base_color {
+            format!("\x1b[38;5;{}m", base)
+        } else {
+            String::new()
+        };
+        let base_color_suffix = if theme.base_color.is_some() {
+            "\x1b[0m".to_string()
+        } else {
+            String::new()
+        };
+        let base_restore = if let Some(base) = theme.base_color {
+            format!("\x1b[38;5;{}m", base)
+        } else {
+            "\x1b[39m".to_string()
+        };
+
         Self {
             theme,
             no_color,
             ansi_span_regex,
+            base_color_prefix,
+            base_color_suffix,
+            base_restore,
         }
     }
     
@@ -39,8 +61,12 @@ impl Colorizer {
         }
         
         // 3. Apply base color to the whole line (preserves inner highlights)
-        if let Some(base_color) = self.theme.base_color {
-            result = format!("\x1b[38;5;{}m{}\x1b[0m", base_color, result);
+        if !self.base_color_prefix.is_empty() {
+            let mut colored = String::with_capacity(self.base_color_prefix.len() + result.len() + self.base_color_suffix.len());
+            colored.push_str(&self.base_color_prefix);
+            colored.push_str(&result);
+            colored.push_str(&self.base_color_suffix);
+            result = colored;
         }
         
         result
@@ -74,13 +100,7 @@ impl Colorizer {
     }
     
     fn wrap_with_base_restore(&self, text: &str, color: &Color) -> String {
-        let reset = if let Some(base) = self.theme.base_color {
-            format!("\x1b[38;5;{}m", base)
-        } else {
-            "\x1b[39m".to_string() // Reset to default
-        };
-        
-        format!("{}{}{}", color.to_ansi_fg(), text, reset)
+        format!("{}{}{}", color.to_ansi_fg(), text, self.base_restore)
     }
     
     pub fn theme_name(&self) -> &str {
